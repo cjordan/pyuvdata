@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 ### Added
 - `propagate_flags` keyword for `UVData.frequency_average` which flags averaged samples if any contributing samples were flagged
 
+### Fixed
+- A bug in `UVData.downsample_in_time` where the data were not being properly weighted by the nsample array and the nsample_array was not being properly weighted by the integration times.
+- A bug in `UVData.downsample_in_time` that lead to duplicated data on the final object if a baseline had varying integration times and some integration times were greater than or equal to the requested minimum integration time.
+
 ## [2.0.2] - 2020-4-29
 
 ### Added
