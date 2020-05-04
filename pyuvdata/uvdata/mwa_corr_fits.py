@@ -5,6 +5,7 @@
 """Class for reading MWA correlator FITS files."""
 import numpy as np
 import warnings
+from astropy.coordinates import Angle
 from astropy.io import fits
 from astropy.time import Time
 from astropy import constants as const
@@ -237,7 +238,172 @@ class MWACorrFITS(UVData):
 
         """
         metafits_file = None
-        ppds_file = None
+
+        # Use pymwalib if it's available. Otherwise, use the pyuvdata methodology.
+        try:
+            from pymwalib.context import Context
+
+            # Isolate the metafits file from the gpubox files.
+            # TODO: Merge this with the code below.
+            gpuboxes = []
+            for file in filelist:
+                if file.lower().endswith('.metafits'):
+                    if metafits_file is not None:
+                        raise ValueError('multiple metafits files in filelist')
+                    metafits_file = file
+                elif file.lower().endswith('.fits'):
+                    gpuboxes.append(file)
+                elif file.lower().endswith('.mwaf'):
+                    raise ValueError('TODO: Support mwaf files in mwalib!')
+                else:
+                    raise ValueError('only fits and metafits files supported')
+
+            with fits.open(metafits_file, memmap=True) as meta:
+                meta_hdr = meta[0].header
+                meta_tbl = meta[1].data
+
+            # first set parameters that are always true
+            self.Nspws = 1
+            self.spw_array = np.array([0])
+            self.phase_type = 'drift'
+            self.vis_units = 'uncalib'
+            self.Npols = 4
+            self.xorientation = 'east'
+
+            self.center_xyz = None
+            self.latitude = Angle('-26d42m11.94986s').radian
+            self.longitude = Angle('116d40m14.93485s').radian
+            self.altitude = 377.827
+            self.citation = "Tingay et al., 2013"
+
+            # Send the MWA data to pymwalib.
+            with Context(metafits_file, gpuboxes) as context:
+                # Populate other pyuvdata fields from pymwalib.
+                # CHJ: I'm ignoring history and extra_keywords.
+                self.history = ""
+                self.extra_keywords = {}
+
+                self.channel_width = float(context.fine_channel_width_hz)
+                self.instrument = "MWA"
+                self.telescope_name = "MWA"
+                self.object_name = context.observation_name
+
+                # Ignore antennas.
+                self.antenna_numbers = [x for x in range(context.num_antennas)]
+                self.antenna_names = [str(x) for x in range(context.num_antennas)]
+
+                self.Nants_data = context.num_antennas
+                self.Nants_telescope = context.num_antennas
+                # context.num_baselines has num. cross-correlation baselines +
+                # num. auto-correlations.
+                self.Nbls = context.num_baselines
+
+                # build time array of centers
+                start_time = context.start_unix_time_milliseconds / 1000.0
+                end_time = context.end_unix_time_milliseconds / 1000.0
+                int_time = context.integration_time_milliseconds / 1000.0
+                time_array = np.arange(start_time + int_time / 2.0,
+                                       end_time + int_time / 2.0 + int_time,
+                                       int_time)
+                # convert to time to jd floats
+                float_time_array = Time(time_array, format="unix", scale="utc").jd.astype(float)
+                self.time_array = np.repeat(float_time_array, self.Nbls)
+                self.Ntimes = len(time_array)
+                self.Nblts = int(self.Nbls * self.Ntimes)
+                self.Nfreqs = context.num_coarse_channels * context.num_fine_channels_per_coarse
+
+                # build frequency array
+                self.freq_array = np.zeros((self.Nspws, self.Nfreqs))
+                width = context.fine_channel_width_hz / 1000
+                avg_factor = width / 10
+                offset = (avg_factor - 1) * 10 / 2.0
+                for i, c in enumerate(context.coarse_channels):
+                    lower_fine_freq = c.channel_centre_hz - (c.channel_width_hz + context.fine_channel_width_hz) / 2.0
+                    first_center = lower_fine_freq + offset
+                    self.freq_array[
+                        0, int(i * context.num_fine_channels_per_coarse):int((i + 1) * context.num_fine_channels_per_coarse)
+                ] = (
+                    np.arange(first_center, first_center + context.num_fine_channels_per_coarse * width, width)
+                    * 1000
+                )
+
+                # get telescope parameters
+                self.set_telescope_params()
+                # polarizations are ordered xx, xy, yx, yy
+                self.polarization_array = np.array([-5, -7, -8, -6])
+
+                ant_1_array = []
+                ant_2_array = []
+                for i in range(self.Nants_telescope):
+                    for j in range(i, self.Nants_telescope):
+                        ant_1_array.append(i)
+                        ant_2_array.append(j)
+
+                self.ant_1_array = np.tile(np.array(ant_1_array), self.Ntimes)
+                self.ant_2_array = np.tile(np.array(ant_2_array), self.Ntimes)
+                self.baseline_array = self.antnums_to_baseline(
+                    self.ant_1_array, self.ant_2_array
+                )
+
+                # create self.uvw_array
+                antenna_numbers = meta_tbl["Antenna"][1::2]
+                antenna_positions = np.zeros((len(antenna_numbers), 3))
+                antenna_positions[:, 0] = meta_tbl["East"][1::2]
+                antenna_positions[:, 1] = meta_tbl["North"][1::2]
+                antenna_positions[:, 2] = meta_tbl["Height"][1::2]
+                reordered_inds = antenna_numbers.argsort()
+                self.antenna_numbers = antenna_numbers[reordered_inds]
+                antenna_positions = antenna_positions[reordered_inds, :]
+                antenna_positions_ecef = uvutils.ECEF_from_ENU(
+                    antenna_positions, *self.telescope_location_lat_lon_alt
+                )
+                # make antenna positions relative to telescope location
+                self.antenna_positions = antenna_positions_ecef - self.telescope_location
+                self.set_uvws_from_antenna_positions(allow_phasing=False)
+
+                # convert times to lst
+                self.lst_array = uvutils.get_lst_for_time(self.time_array,
+                                                          *self.telescope_location_lat_lon_alt_degrees)
+                self.integration_time = np.array([int_time for i in range(self.Nblts)])
+
+                # Use pymwalib to extract the data.
+                self.data_array = np.zeros(
+                    (self.Nbls * self.Ntimes, 1, self.Nfreqs, self.Npols), dtype=np.complex64
+                )
+                self.nsample_array = np.full(
+                    (self.Nbls * self.Ntimes, 1, self.Nfreqs, self.Npols), 1.0, dtype=np.float16
+                )
+                self.flag_array = np.full(
+                    (self.Nbls * self.Ntimes, 1, self.Nfreqs, self.Npols), False
+                )
+
+                for timestep_index in range(0, context.num_timesteps):
+                    time_ind = timestep_index * self.Nbls
+                    time_ind2 = time_ind + self.Nbls
+                    # print("time_ind:", time_ind)
+                    for coarse_channel_ind in range(0, context.num_coarse_channels):
+                        freq_ind = coarse_channel_ind * context.num_fine_channels_per_coarse
+                        freq_ind2 = freq_ind + context.num_fine_channels_per_coarse
+                        # print("freq_ind:", freq_ind)
+                        data = context.read_by_baseline(
+                            timestep_index, coarse_channel_ind
+                        ).reshape((self.Nbls, context.num_fine_channels_per_coarse, self.Npols * 2))
+                        self.data_array[
+                            time_ind:time_ind2, 0, freq_ind:freq_ind2, :
+                        ] = data.view(np.complex64)
+                        # self.data_array[
+                        #     time_ind:time_ind2, freq_ind:freq_ind2, :
+                        # ] += 1j * data[:, :, 1::2]
+                        del data
+                # import time
+                # time.sleep(10)
+
+            # Don't execute built-in pyuvdata code.
+            return
+        except ImportError:
+            assert 1==0
+            pass
+
         obs_id = None
         file_dict = {}
         start_time = 0.0
