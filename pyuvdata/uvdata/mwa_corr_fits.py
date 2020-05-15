@@ -241,176 +241,13 @@ class MWACorrFITS(UVData):
             from pymwalib.context import Context
             pymwalib = True
         except ImportError:
+            # Crash and burn for now
+            assert False
             warnings.warn("pymwalib not found")
             pymwalib = False
 
-        # Isolate the metafits file from the gpubox files.
-        # TODO: Merge this with the code below.
         metafits_file = None
         ppds_file = None
-        gpuboxes = []
-        for file in filelist:
-            if file.lower().endswith('.metafits'):
-                if metafits_file is not None:
-                    raise ValueError('multiple metafits files in filelist')
-                metafits_file = file
-            elif file.lower().endswith('.fits'):
-                gpuboxes.append(file)
-            elif file.lower().endswith('.mwaf'):
-                raise ValueError('TODO: Support mwaf files in mwalib!')
-            else:
-                raise ValueError('only fits and metafits files supported')
-
-        with fits.open(metafits_file, memmap=True) as meta:
-            meta_hdr = meta[0].header
-            meta_tbl = meta[1].data
-
-        # first set parameters that are always true
-        self.Nspws = 1
-        self.spw_array = np.array([0])
-        self.phase_type = 'drift'
-        self.vis_units = 'uncalib'
-        self.Npols = 4
-        self.xorientation = 'east'
-
-
-        # Send the MWA data to pymwalib.
-        context = Context(metafits_file, gpuboxes)
-
-        # Populate other pyuvdata fields from pymwalib.
-        self.center_xyz = None
-        self.latitude = context.mwa_latitude_radians
-        self.longitude = context.mwa_longitude_radians
-        self.altitude = context.mwa_altitude_m
-        self.citation = "Tingay et al., 2013"
-
-        # CHJ: I'm ignoring history and extra_keywords.
-        self.history = ""
-        self.extra_keywords = {}
-
-        self.channel_width = float(context.fine_channel_width_hz)
-        self.instrument = "MWA"
-        self.telescope_name = "MWA"
-        self.object_name = context.observation_name
-
-        # Ignore antennas.
-        self.antenna_numbers = [x for x in range(context.num_antennas)]
-        self.antenna_names = [str(x) for x in range(context.num_antennas)]
-
-        self.Nants_data = context.num_antennas
-        self.Nants_telescope = context.num_antennas
-        # context.num_baselines has num. cross-correlation baselines +
-        # num. auto-correlations.
-        self.Nbls = context.num_baselines
-
-        # build time array of centers
-        start_time = context.start_unix_time_milliseconds / 1000.0
-        end_time = context.end_unix_time_milliseconds / 1000.0
-        int_time = context.integration_time_milliseconds / 1000.0
-        time_array = np.arange(start_time + int_time / 2.0,
-                               end_time + int_time / 2.0 + int_time,
-                               int_time)
-        # convert to time to jd floats
-        float_time_array = Time(time_array, format="unix", scale="utc").jd.astype(float)
-        self.time_array = np.repeat(float_time_array, self.Nbls)
-        self.Ntimes = len(time_array)
-        self.Nblts = int(self.Nbls * self.Ntimes)
-        self.Nfreqs = context.num_coarse_channels * context.num_fine_channels_per_coarse
-
-        # build frequency array
-        self.freq_array = np.zeros((self.Nspws, self.Nfreqs))
-        width = context.fine_channel_width_hz / 1000
-        avg_factor = width / 10
-        offset = (avg_factor - 1) * 10 / 2.0
-        for i, c in enumerate(context.coarse_channels):
-            lower_fine_freq = c.channel_centre_hz - (c.channel_width_hz + context.fine_channel_width_hz) / 2.0
-            first_center = lower_fine_freq + offset
-            self.freq_array[
-                0, int(i * context.num_fine_channels_per_coarse):int((i + 1) * context.num_fine_channels_per_coarse)
-        ] = (
-            np.arange(first_center, first_center + context.num_fine_channels_per_coarse * width, width)
-            * 1000
-        )
-
-        # get telescope parameters
-        self.set_telescope_params()
-        # polarizations are ordered xx, xy, yx, yy
-        self.polarization_array = np.array([-5, -7, -8, -6])
-
-        ant_1_array = []
-        ant_2_array = []
-        for i in range(self.Nants_telescope):
-            for j in range(i, self.Nants_telescope):
-                ant_1_array.append(i)
-                ant_2_array.append(j)
-
-        self.ant_1_array = np.tile(np.array(ant_1_array), self.Ntimes)
-        self.ant_2_array = np.tile(np.array(ant_2_array), self.Ntimes)
-        self.baseline_array = self.antnums_to_baseline(
-            self.ant_1_array, self.ant_2_array
-        )
-
-        # create self.uvw_array
-        antenna_numbers = meta_tbl["Antenna"][1::2]
-        antenna_positions = np.zeros((len(antenna_numbers), 3))
-        # could use context.rf_inputs, but need to check that those are
-        # what pyuvdata expects.
-        antenna_positions[:, 0] = meta_tbl["East"][1::2]
-        antenna_positions[:, 1] = meta_tbl["North"][1::2]
-        antenna_positions[:, 2] = meta_tbl["Height"][1::2]
-        reordered_inds = antenna_numbers.argsort()
-        self.antenna_numbers = antenna_numbers[reordered_inds]
-        antenna_positions = antenna_positions[reordered_inds, :]
-        antenna_positions_ecef = uvutils.ECEF_from_ENU(
-            antenna_positions, *self.telescope_location_lat_lon_alt
-        )
-        # make antenna positions relative to telescope location
-        self.antenna_positions = antenna_positions_ecef - self.telescope_location
-        self.set_uvws_from_antenna_positions(allow_phasing=False)
-
-        # convert times to lst
-        self.lst_array = uvutils.get_lst_for_time(self.time_array,
-                                                  *self.telescope_location_lat_lon_alt_degrees)
-        self.integration_time = np.array([int_time for i in range(self.Nblts)])
-
-        # Use pymwalib to extract the data.
-        self.data_array = np.zeros(
-            (self.Nbls * self.Ntimes, 1, self.Nfreqs, self.Npols), dtype=np.complex64
-        )
-        self.nsample_array = np.full(
-            (self.Nbls * self.Ntimes, 1, self.Nfreqs, self.Npols), 1.0, dtype=np.float16
-        )
-        self.flag_array = np.full(
-            (self.Nbls * self.Ntimes, 1, self.Nfreqs, self.Npols), False
-        )
-
-        for timestep_index in range(0, context.num_timesteps):
-            time_ind = timestep_index * self.Nbls
-            time_ind2 = time_ind + self.Nbls
-            # print("time_ind:", time_ind)
-            for coarse_channel_ind in range(0, context.num_coarse_channels):
-                freq_ind = coarse_channel_ind * context.num_fine_channels_per_coarse
-                freq_ind2 = freq_ind + context.num_fine_channels_per_coarse
-                # print("freq_ind:", freq_ind)
-                data = context.read_by_baseline(
-                    timestep_index, coarse_channel_ind
-                ).reshape((self.Nbls, context.num_fine_channels_per_coarse, self.Npols * 2))
-                self.data_array[
-                    time_ind:time_ind2, 0, freq_ind:freq_ind2, :
-                ] = data.view(np.complex64)
-                # self.data_array[
-                #     time_ind:time_ind2, freq_ind:freq_ind2, :
-                # ] += 1j * data[:, :, 1::2]
-                del data
-        # import time
-        # time.sleep(10)
-
-        # Don't execute built-in pyuvdata code.
-        return
-        # except ImportError:
-        #     assert 1==0
-        #     pass
-
         obs_id = None
         file_dict = {}
         start_time = 0.0
@@ -445,34 +282,38 @@ class MWACorrFITS(UVData):
                                 "in same list"
                             )
                     # check headers for first and last times containing data
-                    headstart = fits.getheader(file, 1)
-                    headfin = fits.getheader(file, -1)
-                    first_time = headstart["TIME"] + headstart["MILLITIM"] / 1000.0
-                    last_time = headfin["TIME"] + headfin["MILLITIM"] / 1000.0
-                    if start_time == 0.0:
-                        start_time = first_time
-                    # check that files with a timing offset can be aligned
-                    elif np.abs(start_time - first_time) % headstart["INTTIME"] != 0.0:
-                        raise ValueError(
-                            "coarse channel start times are misaligned by an amount that is not \
-                                an integer multiple of the integration time"
-                        )
-                    elif start_time > first_time:
-                        start_time = first_time
-                    if end_time < last_time:
-                        end_time = last_time
-                    # get number of fine channels
-                    if num_fine_chans == 0:
-                        num_fine_chans = headstart["NAXIS2"]
-                    elif num_fine_chans != headstart["NAXIS2"]:
-                        raise ValueError(
-                            "files submitted have different fine channel widths"
-                        )
-                    # get the file number from the file name;
-                    # this will later be mapped to a coarse channel
-                    file_num = int(file.split("_")[-2][-2:])
-                    if file_num not in included_file_nums:
+                    if pymwalib:
+                        file_num = int(file.split("_")[-2][-2:])
                         included_file_nums.append(file_num)
+                    else:
+                        headstart = fits.getheader(file, 1)
+                        headfin = fits.getheader(file, -1)
+                        first_time = headstart["TIME"] + headstart["MILLITIM"] / 1000.0
+                        last_time = headfin["TIME"] + headfin["MILLITIM"] / 1000.0
+                        if start_time == 0.0:
+                            start_time = first_time
+                        # check that files with a timing offset can be aligned
+                        elif np.abs(start_time - first_time) % headstart["INTTIME"] != 0.0:
+                            raise ValueError(
+                                "coarse channel start times are misaligned by an amount that is not \
+                                    an integer multiple of the integration time"
+                            )
+                        elif start_time > first_time:
+                            start_time = first_time
+                        if end_time < last_time:
+                            end_time = last_time
+                        # get number of fine channels
+                        if num_fine_chans == 0:
+                            num_fine_chans = headstart["NAXIS2"]
+                        elif num_fine_chans != headstart["NAXIS2"]:
+                            raise ValueError(
+                                "files submitted have different fine channel widths"
+                            )
+                        # get the file number from the file name;
+                        # this will later be mapped to a coarse channel
+                        file_num = int(file.split("_")[-2][-2:])
+                        if file_num not in included_file_nums:
+                            included_file_nums.append(file_num)
                     # organize files
                     if "data" not in file_dict.keys():
                         file_dict["data"] = [file]
@@ -509,13 +350,28 @@ class MWACorrFITS(UVData):
                              or use_cotter_flags=False"
             )
 
+        # If we can, send the MWA data to mwalib via pymwalib.
+        if pymwalib:
+            context = Context(metafits_file, file_dict["data"])
+            # mwalib determines the appropriate start and end times for us. All
+            # gpubox files have these times.
+            int_time = context.integration_time_milliseconds / 1000.0
+            start_time = context.start_unix_time_milliseconds / 1000.0
+            # mwalib defines the end obs. time as the start time of the last HDU
+            # + int. time. Adjust to match pyuvdata.
+            end_time = context.end_unix_time_milliseconds / 1000.0 - int_time
+            num_fine_chans = context.num_fine_channels_per_coarse
+
         # first set parameters that are always true
         self.Nspws = 1
         self.spw_array = np.array([0])
         self.phase_type = "drift"
         self.vis_units = "uncalib"
-        self.Npols = 4
         self.xorientation = "east"
+        if pymwalib:
+            self.Npols = context.num_visibility_pols
+        else:
+            self.Npols = 4
 
         # get information from metafits file
         with fits.open(metafits_file, memmap=True) as meta:
@@ -526,17 +382,28 @@ class MWACorrFITS(UVData):
             coarse_chans = np.array(sorted(int(i) for i in coarse_chans))
 
             # integration time in seconds
-            int_time = meta_hdr["INTTIME"]
+            if not pymwalib:
+                int_time = meta_hdr["INTTIME"]
 
             # pointing center in degrees
-            ra_deg = meta_hdr["RA"]
-            dec_deg = meta_hdr["DEC"]
-            ra_rad = np.pi * ra_deg / 180
-            dec_rad = np.pi * dec_deg / 180
+            if pymwalib:
+                ra_deg = context.ra_tile_pointing_degrees
+                dec_deg = context.dec_tile_pointing_degrees
+                ra_rad = np.deg2rad(ra_deg)
+                dec_rad = np.deg2rad(dec_deg)
+            else:
+                ra_deg = meta_hdr["RA"]
+                dec_deg = meta_hdr["DEC"]
+                ra_rad = np.pi * ra_deg / 180
+                dec_rad = np.pi * dec_deg / 180
 
             # get parameters from header
             # this assumes no averaging by this code so will need to be updated
-            self.channel_width = float(meta_hdr.pop("FINECHAN") * 1000)
+            if pymwalib:
+                self.channel_width = float(context.fine_channel_width_hz)
+            else:
+                self.channel_width = float(meta_hdr.pop("FINECHAN") * 1000)
+
             if "HISTORY" in meta_hdr:
                 self.history = str(meta_hdr["HISTORY"])
                 meta_hdr.remove("HISTORY", remove_all=True)
@@ -564,18 +431,33 @@ class MWACorrFITS(UVData):
                     self.extra_keywords[key] = meta_hdr.get(key)
             # get antenna data from metafits file table
             meta_tbl = meta[1].data
-
-            # because of polarization, each antenna # is listed twice
-            antenna_numbers = meta_tbl["Antenna"][1::2]
-            antenna_names = meta_tbl["TileName"][1::2]
-            antenna_flags = meta_tbl["Flag"][1::2]
             cable_lens = meta_tbl["Length"][1::2]
+            if pymwalib:
+                antenna_numbers = np.array([x.antenna for x in context.antennas])
+                antenna_names = np.array([x.tile_name for x in context.antennas])
+                # Flag information is against the rf_inputs, but we want it for
+                # each antenna. Consider the antenna flagged if either of its
+                # inputs are flagged.
+                antenna_flags = np.array([context.rf_inputs[i].flagged or context.rf_inputs[i+1].flagged
+                                          for i, _ in enumerate(context.antennas)])
+                antenna_positions = np.zeros((len(context.rf_inputs) // 2, 3))
+                for (a, rf) in enumerate(context.rf_inputs):
+                    if a % 2 == 1:
+                        continue
+                    antenna_positions[a // 2, 0] = rf.east_m
+                    antenna_positions[a // 2, 1] = rf.north_m
+                    antenna_positions[a // 2, 2] = rf.height_m
+            else:
+                # because of polarization, each antenna # is listed twice
+                antenna_numbers = meta_tbl["Antenna"][1::2]
+                antenna_names = meta_tbl["TileName"][1::2]
+                antenna_flags = meta_tbl["Flag"][1::2]
 
-            # get antenna postions in enu coordinates
-            antenna_positions = np.zeros((len(antenna_numbers), 3))
-            antenna_positions[:, 0] = meta_tbl["East"][1::2]
-            antenna_positions[:, 1] = meta_tbl["North"][1::2]
-            antenna_positions[:, 2] = meta_tbl["Height"][1::2]
+                # get antenna postions in enu coordinates
+                antenna_positions = np.zeros((len(antenna_numbers), 3))
+                antenna_positions[:, 0] = meta_tbl["East"][1::2]
+                antenna_positions[:, 1] = meta_tbl["North"][1::2]
+                antenna_positions[:, 2] = meta_tbl["Height"][1::2]
 
         # reorder antenna parameters from metafits ordering
         reordered_inds = antenna_numbers.argsort()
@@ -589,14 +471,26 @@ class MWACorrFITS(UVData):
         flagged_ants = self.antenna_numbers[np.where(antenna_flags == 1)]
 
         # set parameters from other parameters
-        self.Nants_data = len(self.antenna_numbers)
-        self.Nants_telescope = len(self.antenna_numbers)
-        self.Nbls = int(
-            len(self.antenna_numbers) * (len(self.antenna_numbers) + 1) / 2.0
-        )
+        if pymwalib:
+            self.Nants_data = context.num_antennas
+            self.Nants_telescope = context.num_antennas
+            # self.Nbls has num. cross-correlation baselines +
+            # num. auto-correlations.
+            self.Nbls = context.num_baselines
+        else:
+            self.Nants_data = len(self.antenna_numbers)
+            self.Nants_telescope = len(self.antenna_numbers)
+            self.Nbls = int(
+                len(self.antenna_numbers) * (len(self.antenna_numbers) + 1) / 2.0
+            )
 
         # get telescope parameters
         self.set_telescope_params()
+        if pymwalib:
+            self.center_xyz = None
+            self.latitude = context.mwa_latitude_radians
+            self.longitude = context.mwa_longitude_radians
+            self.altitude = context.mwa_altitude_metres
 
         # build time array of centers
         time_array = np.arange(
@@ -689,7 +583,10 @@ class MWACorrFITS(UVData):
             warnings.warn("some coarse channel files were not submitted")
 
         # build frequency array
-        self.Nfreqs = len(included_coarse_chans) * num_fine_chans
+        if pymwalib:
+            self.Nfreqs = context.num_coarse_channels * context.num_fine_channels_per_coarse
+        else:
+            self.Nfreqs = len(included_coarse_chans) * num_fine_chans
         self.freq_array = np.zeros((self.Nspws, self.Nfreqs))
 
         # each coarse channel is split into 128 fine channels of width 10 kHz.
@@ -724,104 +621,153 @@ class MWACorrFITS(UVData):
             )
 
         # read data into an array with dimensions (time, uv, baselines*pols)
-        self.data_array = np.zeros(
-            (self.Ntimes, self.Nfreqs, self.Nbls * self.Npols), dtype=np.complex128
-        )
-        self.nsample_array = np.zeros(
-            (self.Ntimes, self.Nfreqs, self.Nbls * self.Npols), dtype=np.float32
-        )
-        self.flag_array = np.full(
-            (self.Ntimes, self.Nfreqs, self.Nbls * self.Npols), True
-        )
+        # pymwalib allows us to access the data in a shape that pyuvdata wants,
+        # so we only need to create the arrays in the shape that this function
+        # would otherwise produce.
+        if pymwalib:
+            self.data_array = np.zeros(
+                (self.Nbls * self.Ntimes, self.Nfreqs, self.Npols), dtype=np.complex64
+            )
+            self.nsample_array = np.zeros(
+                (self.Nbls * self.Ntimes, self.Nfreqs, self.Npols), dtype=np.float16
+            )
+            self.flag_array = np.full(
+                (self.Nbls * self.Ntimes, self.Nfreqs, self.Npols), True
+            )
+        else:
+            self.data_array = np.zeros(
+                (self.Ntimes, self.Nfreqs, self.Nbls * self.Npols), dtype=np.complex64
+            )
+            self.nsample_array = np.zeros(
+                (self.Ntimes, self.Nfreqs, self.Nbls * self.Npols), dtype=np.float16
+            )
+            self.flag_array = np.full(
+                (self.Ntimes, self.Nfreqs, self.Nbls * self.Npols), True
+            )
 
         # read data files
-        for file in file_dict["data"]:
-            # get the file number from the file name
-            file_num = int(file.split("_")[-2][-2:])
-            # map file number to frequency index
-            freq_ind = file_nums_to_index[file_num] * num_fine_chans
-            with fits.open(
-                file, memmap=False, do_not_scale_image_data=False
-            ) as hdu_list:
-                # count number of times
-                end_list = len(hdu_list)
-                for i in range(1, end_list):
-                    time = (
-                        hdu_list[i].header["TIME"]
-                        + hdu_list[i].header["MILLITIM"] / 1000.0
-                        + int_time / 2.0
-                    )
-                    time_ind = np.where(time_array == time)[0][0]
-                    # dump data into matrix
-                    # and take data from real to complex numbers
+        if pymwalib:
+            for timestep_index in range(0, context.num_timesteps):
+                time_i = timestep_index * self.Nbls
+                time_i2 = time_i + self.Nbls
+                for coarse_channel_ind in range(0, context.num_coarse_channels):
+                    freq_i = coarse_channel_ind * context.num_fine_channels_per_coarse
+                    freq_i2 = freq_i + context.num_fine_channels_per_coarse
+                    data = context.read_by_baseline(
+                        timestep_index, coarse_channel_ind
+                    ).reshape((self.Nbls, num_fine_chans, self.Npols * 2))
                     self.data_array[
-                        time_ind, freq_ind : freq_ind + num_fine_chans, :
-                    ] = (hdu_list[i].data[:, 0::2] + 1j * hdu_list[i].data[:, 1::2])
+                        time_i:time_i2, freq_i:freq_i2, :
+                    ] = data.view(np.complex64)
                     self.nsample_array[
-                        time_ind, freq_ind : freq_ind + num_fine_chans, :
+                        time_i:time_i2, freq_i:freq_i2, :
                     ] = 1.0
                     self.flag_array[
-                        time_ind, freq_ind : freq_ind + num_fine_chans, :
+                        time_i:time_i2, freq_i:freq_i2, :
                     ] = False
+        else:
+            for file in file_dict["data"]:
+                # get the file number from the file name
+                file_num = int(file.split("_")[-2][-2:])
+                # map file number to frequency index
+                freq_ind = file_nums_to_index[file_num] * num_fine_chans
+                with fits.open(
+                    file, memmap=False, do_not_scale_image_data=False
+                ) as hdu_list:
+                    # count number of times
+                    end_list = len(hdu_list)
+                    for i in range(1, end_list):
+                        time = (
+                            hdu_list[i].header["TIME"]
+                            + hdu_list[i].header["MILLITIM"] / 1000.0
+                            + int_time / 2.0
+                        )
+                        time_ind = np.where(time_array == time)[0][0]
+                        # dump data into matrix
+                        # and take data from real to complex numbers
+                        self.data_array[
+                            time_ind, freq_ind: freq_ind + num_fine_chans, :
+                        ] = (hdu_list[i].data[:, 0::2] + 1j * hdu_list[i].data[:, 1::2])
+                        self.nsample_array[
+                            time_ind, freq_ind: freq_ind + num_fine_chans, :
+                        ] = 1.0
+                        self.flag_array[
+                            time_ind, freq_ind: freq_ind + num_fine_chans, :
+                        ] = False
 
-        # polarizations are ordered yy, yx, xy, xx
-        self.polarization_array = np.array([-6, -8, -7, -5])
+        if pymwalib:
+            # polarizations are ordered xx, xy, yx, yy
+            self.polarization_array = np.array([-5, -7, -8, -6])
+        else:
+            # polarizations are ordered yy, yx, xy, xx
+            self.polarization_array = np.array([-6, -8, -7, -5])
 
-        # build mapper from antenna numbers and polarizations to pfb inputs
-        corr_ants_to_pfb_inputs = {}
-        for i in range(len(antenna_numbers)):
-            for p in range(2):
-                corr_ants_to_pfb_inputs[(antenna_numbers[i], p)] = 2 * i + p
+        # mwalib does the reordering internally.
+        if not pymwalib:
+            # build mapper from antenna numbers and polarizations to pfb inputs
+            corr_ants_to_pfb_inputs = {}
+            for i in range(len(antenna_numbers)):
+                for p in range(2):
+                    corr_ants_to_pfb_inputs[(antenna_numbers[i], p)] = 2 * i + p
 
-        # for mapping, start with a pair of antennas/polarizations
-        # this is the pair we want to find the data for
-        # map the pair to the corresponding pfb input indices
-        # map the pfb input indices to the pfb output indices
-        # these are the indices for the data corresponding to the initial
-        # antenna/pol pair
-        # generate a mapping index array
-        map_inds = np.zeros((self.Nbls * self.Npols), dtype=np.int32)
-        # generate a conjugation array
-        conj = np.full((self.Nbls * self.Npols), False, dtype=np.bool_)
-        pfb_inputs_to_outputs = input_output_mapping()
+            # for mapping, start with a pair of antennas/polarizations
+            # this is the pair we want to find the data for
+            # map the pair to the corresponding pfb input indices
+            # map the pfb input indices to the pfb output indices
+            # these are the indices for the data corresponding to the initial
+            # antenna/pol pair
+            # generate a mapping index array
+            map_inds = np.zeros((self.Nbls * self.Npols), dtype=np.int32)
+            # generate a conjugation array
+            conj = np.full((self.Nbls * self.Npols), False, dtype=np.bool_)
+            pfb_inputs_to_outputs = input_output_mapping()
 
-        map_inds, conj = _corr_fits.generate_map(
-            corr_ants_to_pfb_inputs, pfb_inputs_to_outputs, map_inds, conj,
-        )
-        # reorder data
-        self.data_array = self.data_array[:, :, map_inds]
-        self.nsample_array = self.nsample_array[:, :, map_inds]
-        self.flag_array = self.flag_array[:, :, map_inds]
-        # conjugate data
-        self.data_array[:, :, conj] = np.conj(self.data_array[:, :, conj])
-        # reshape data
-        self.data_array = self.data_array.reshape(
-            (self.Ntimes, self.Nfreqs, self.Nbls, self.Npols)
-        )
-        self.nsample_array = self.nsample_array.reshape(
-            (self.Ntimes, self.Nfreqs, self.Nbls, self.Npols)
-        )
-        self.flag_array = self.flag_array.reshape(
-            (self.Ntimes, self.Nfreqs, self.Nbls, self.Npols)
-        )
-        self.data_array = np.swapaxes(self.data_array, 1, 2)
-        self.nsample_array = np.swapaxes(self.nsample_array, 1, 2)
-        self.flag_array = np.swapaxes(self.flag_array, 1, 2)
+            map_inds, conj = _corr_fits.generate_map(
+                corr_ants_to_pfb_inputs, pfb_inputs_to_outputs, map_inds, conj,
+            )
+            # reorder data
+            self.data_array = self.data_array[:, :, map_inds]
+            self.nsample_array = self.nsample_array[:, :, map_inds]
+            self.flag_array = self.flag_array[:, :, map_inds]
+            # conjugate data
+            self.data_array[:, :, conj] = np.conj(self.data_array[:, :, conj])
+            # reshape data
+            self.data_array = self.data_array.reshape(
+                (self.Ntimes, self.Nfreqs, self.Nbls, self.Npols)
+            )
+            self.nsample_array = self.nsample_array.reshape(
+                (self.Ntimes, self.Nfreqs, self.Nbls, self.Npols)
+            )
+            self.flag_array = self.flag_array.reshape(
+                (self.Ntimes, self.Nfreqs, self.Nbls, self.Npols)
+            )
+            self.data_array = np.swapaxes(self.data_array, 1, 2)
+            self.nsample_array = np.swapaxes(self.nsample_array, 1, 2)
+            self.flag_array = np.swapaxes(self.flag_array, 1, 2)
 
         # generage baseline flags for flagged ants
         bad_ant_inds = []
-        for ant1 in range(128):
-            for ant2 in range(ant1, 128):
-                if ant1 in flagged_ants or ant2 in flagged_ants:
-                    bad_ant_inds.append(int(128 * ant1 - ant1 * (ant1 + 1) / 2 + ant2))
-        self.flag_array[:, bad_ant_inds, :, :] = True
+        if pymwalib:
+            for ant1 in range(context.num_antennas):
+                for ant2 in range(ant1, context.num_antennas):
+                    if ant1 in flagged_ants or ant2 in flagged_ants:
+                        i = self.Ntimes * int(context.num_antennas * ant1 - ant1 * (ant1 + 1) / 2 + ant2)
+                        bad_ant_inds.append(i)
+            self.flag_array[bad_ant_inds, :, :] = True
+        else:
+            for ant1 in range(128):
+                for ant2 in range(ant1, 128):
+                    if ant1 in flagged_ants or ant2 in flagged_ants:
+                        bad_ant_inds.append(int(128 * ant1 - ant1 * (ant1 + 1) / 2 + ant2))
+            self.flag_array[:, bad_ant_inds, :, :] = True
 
-        # combine baseline and time axes
-        self.data_array = self.data_array.reshape((self.Nblts, self.Nfreqs, self.Npols))
-        self.flag_array = self.flag_array.reshape((self.Nblts, self.Nfreqs, self.Npols))
-        self.nsample_array = self.nsample_array.reshape(
-            (self.Nblts, self.Nfreqs, self.Npols)
-        )
+        if not pymwalib:
+            # combine baseline and time axes
+            self.data_array = self.data_array.reshape((self.Nblts, self.Nfreqs, self.Npols))
+            self.flag_array = self.flag_array.reshape((self.Nblts, self.Nfreqs, self.Npols))
+            self.nsample_array = self.nsample_array.reshape(
+                (self.Nblts, self.Nfreqs, self.Npols)
+            )
 
         # cable delay corrections
         if correct_cable_len:
@@ -831,14 +777,15 @@ class MWACorrFITS(UVData):
         self.data_array = self.data_array[:, np.newaxis, :, :]
         self.flag_array = self.flag_array[:, np.newaxis, :, :]
         self.nsample_array = self.nsample_array[:, np.newaxis, :, :]
+        # TODO: What magic lurks in self.reorder_pols()?
+        if not pymwalib:
+            # because of an annoying discrepancy between file conventions, in order
+            # to be consistent with the uvw vector direction, all the data must
+            # be conjugated
+            self.data_array = np.conj(self.data_array)
 
-        # because of an annoying discrepancy between file conventions, in order
-        # to be consistent with the uvw vector direction, all the data must
-        # be conjugated
-        self.data_array = np.conj(self.data_array)
-
-        # reorder polarizations
-        self.reorder_pols()
+            # reorder polarizations
+            self.reorder_pols()
 
         # phasing
         if phase_to_pointing_center:
@@ -857,3 +804,5 @@ class MWACorrFITS(UVData):
             raise NotImplementedError(
                 "reading in cotter flag files is not yet available"
             )
+
+        print("read_mwa_corr_fits finished")
